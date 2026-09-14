@@ -5377,6 +5377,35 @@ Guild
 
         :type: List[:class:`Message`]
 
+.. class:: GuildSearchResults
+
+    Represents the results of :meth:`Guild.search`. This is both an :term:`asynchronous iterator`
+    yielding :class:`SearchResult` and a container for metadata about the overall search, which is
+    only populated once the first page of results has been fetched.
+
+    .. versionadded:: 2.8
+
+    .. attribute:: total_results
+
+        The total number of messages matching the search. This is ``None`` until the first page
+        of results has been fetched.
+
+        :type: Optional[:class:`int`]
+    .. attribute:: doing_deep_historical_index
+
+        Whether the guild is still undergoing a deep historical index, meaning not all of the
+        guild's messages have been indexed for search yet. This is ``None`` until the first page
+        of results has been fetched.
+
+        :type: Optional[:class:`bool`]
+    .. attribute:: documents_indexed
+
+        The number of messages that have been indexed for search so far, if provided by Discord.
+        This is ``None`` until the first page of results has been fetched, and may remain ``None``
+        afterwards.
+
+        :type: Optional[:class:`int`]
+
 GuildPreview
 ~~~~~~~~~~~~
 

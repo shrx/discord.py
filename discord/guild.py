@@ -24,6 +24,7 @@ DEALINGS IN THE SOFTWARE.
 
 from __future__ import annotations
 
+import asyncio
 import copy
 import datetime
 from typing import (
@@ -55,7 +56,7 @@ from .emoji import Emoji
 from .errors import InvalidData
 from .permissions import PermissionOverwrite
 from .colour import Colour
-from .errors import ClientException
+from .errors import ClientException, RateLimited
 from .channel import *
 from .channel import _guild_channel_factory
 from .channel import _threaded_guild_channel_factory
@@ -107,6 +108,7 @@ __all__ = (
     'GuildPreview',
     'BanEntry',
     'SearchResult',
+    'GuildSearchResults',
 )
 
 MISSING = utils.MISSING
@@ -145,7 +147,6 @@ if TYPE_CHECKING:
     from .types.widget import EditWidgetSettings
     from .types.audit_log import AuditLogEvent
     from .message import EmojiInputType, Message
-    from .types.message import MessageSearchResult
     from .onboarding import OnboardingPrompt
 
     VocalGuildChannel = Union[VoiceChannel, StageChannel]
@@ -166,6 +167,40 @@ class BulkBanResult(NamedTuple):
 class SearchResult(NamedTuple):
     message: Message
     context: List[Message]
+
+
+class GuildSearchResults:
+    """Represents the results of :meth:`Guild.search`.
+
+    This is both an :term:`asynchronous iterator` yielding :class:`SearchResult`
+    and a container for metadata about the overall search, which is only
+    populated once the first page of results has been fetched.
+
+    .. versionadded:: 2.8
+
+    Attributes
+    -----------
+    total_results: Optional[:class:`int`]
+        The total number of messages matching the search. This is ``None``
+        until the first page of results has been fetched.
+    doing_deep_historical_index: Optional[:class:`bool`]
+        Whether the guild is still undergoing a deep historical index, meaning
+        not all of the guild's messages have been indexed for search yet.
+        This is ``None`` until the first page of results has been fetched.
+    documents_indexed: Optional[:class:`int`]
+        The number of messages that have been indexed for search so far, if
+        provided by Discord. This is ``None`` until the first page of results
+        has been fetched, and may remain ``None`` afterwards.
+    """
+
+    def __init__(self, iterator: AsyncIterator[SearchResult]) -> None:
+        self.__iterator: AsyncIterator[SearchResult] = iterator
+        self.total_results: Optional[int] = None
+        self.doing_deep_historical_index: Optional[bool] = None
+        self.documents_indexed: Optional[int] = None
+
+    def __aiter__(self) -> AsyncIterator[SearchResult]:
+        return self.__iterator
 
 
 class _GuildLimit(NamedTuple):
@@ -4370,7 +4405,7 @@ class Guild(Hashable):
                 # There's no data left after this
                 break
 
-    async def search(
+    def search(
         self,
         *,
         content: Optional[str] = None,
@@ -4382,8 +4417,8 @@ class Guild(Hashable):
         mention_everyone: Optional[bool] = None,
         replied_to_user: Sequence[Snowflake] = MISSING,
         replied_to_message: Sequence[Snowflake] = MISSING,
-        min_id: Optional[Snowflake] = None,
-        max_id: Optional[Snowflake] = None,
+        before: Optional[SnowflakeTime] = None,
+        after: Optional[SnowflakeTime] = None,
         has: Union[SearchHasType, Sequence[SearchHasType]] = MISSING,
         link_hostname: Sequence[str] = MISSING,
         embed_provider: Sequence[str] = MISSING,
@@ -4397,16 +4432,20 @@ class Guild(Hashable):
         sort_order: SearchSortOrder = SearchSortOrder.descending,
         cursor: Optional[str] = None,
         limit: Optional[int] = 25,
-    ) -> AsyncIterator[SearchResult]:
-        """Returns an :term:`asynchronous iterator` that enables searching the guild's messages.
+        wait_for_index: bool = True,
+    ) -> GuildSearchResults:
+        """Returns a :class:`GuildSearchResults`, which is both an :term:`asynchronous iterator`
+        that enables searching the guild's messages and a container for metadata about the
+        overall search.
 
         You must have :attr:`~Permissions.read_message_history` to do this. Filtering or searching by
         message content additionally requires the :attr:`~Intents.message_content` privileged intent
         to be enabled for the bot.
 
-        If the guild has not finished being indexed for search yet, Discord returns a ``202`` response;
-        in this case this method raises :exc:`HTTPException` with a truthy :attr:`~HTTPException.status`
-        of ``202`` rather than yielding any results. Retrying shortly after usually succeeds.
+        If the guild has not finished being indexed for search yet, Discord returns a response
+        asking to wait ``retry_after`` seconds before searching is possible. By default this method
+        automatically waits and retries; pass ``wait_for_index=False`` to instead raise
+        :exc:`RateLimited` immediately.
 
         .. versionadded:: 2.8
 
@@ -4443,10 +4482,10 @@ class Guild(Hashable):
             Only return messages that are replies to these users.
         replied_to_message: Sequence[:class:`abc.Snowflake`]
             Only return messages that are replies to these messages.
-        min_id: Optional[:class:`abc.Snowflake`]
-            Only return messages with an ID greater than this.
-        max_id: Optional[:class:`abc.Snowflake`]
-            Only return messages with an ID less than this.
+        before: Optional[Union[:class:`abc.Snowflake`, :class:`datetime.datetime`]]
+            Only return messages sent before this message or datetime.
+        after: Optional[Union[:class:`abc.Snowflake`, :class:`datetime.datetime`]]
+            Only return messages sent after this message or datetime.
         has: Union[:class:`SearchHasType`, Sequence[:class:`SearchHasType`]]
             Only return messages that have this type of content (e.g. an embed or an image).
         link_hostname: Sequence[:class:`str`]
@@ -4477,13 +4516,18 @@ class Guild(Hashable):
         limit: Optional[:class:`int`]
             The maximum number of results to return. If ``None``, retrieves as many results as
             Discord allows (search is capped at an internal offset window regardless of this value).
+        wait_for_index: :class:`bool`
+            Whether to automatically wait and retry if the guild has not finished being indexed
+            for search yet, rather than raising :exc:`RateLimited`. Defaults to ``True``.
 
         Raises
         ------
         Forbidden
             You do not have permissions to search the guild's messages.
         HTTPException
-            The request to search failed, or the guild has not finished being indexed yet.
+            The request to search failed.
+        RateLimited
+            The guild has not finished being indexed yet and ``wait_for_index`` was ``False``.
 
         Yields
         -------
@@ -4491,6 +4535,11 @@ class Guild(Hashable):
             A search hit, alongside the surrounding messages Discord returned for context.
         """
         from .message import Message
+
+        if isinstance(before, datetime.datetime):
+            before = Object(id=utils.time_snowflake(before, high=False))
+        if isinstance(after, datetime.datetime):
+            after = Object(id=utils.time_snowflake(after, high=True))
 
         def _enum_values(value: Any) -> Optional[List[Any]]:
             if value is MISSING:
@@ -4504,86 +4553,99 @@ class Guild(Hashable):
                 return None
             return [snowflake.id for snowflake in value]
 
-        offset = 0
-        remaining = limit
+        async def _iterator() -> AsyncIterator[SearchResult]:
+            offset = 0
+            remaining = limit
 
-        while True:
-            if cursor is None:
+            while True:
                 if offset > 9975:
                     return
                 retrieve = 25 if remaining is None else max(0, min(remaining, 25))
                 if retrieve < 1:
                     return
-            else:
-                retrieve = 25 if remaining is None else max(0, min(remaining, 25))
-                if retrieve < 1:
+
+                data: Any = await self._state.http.search_guild_messages(
+                    self.id,
+                    sort_by=sort_by.value,
+                    sort_order=sort_order.value,
+                    content=content,
+                    slop=slop,
+                    author_id=_snowflake_values(author),
+                    author_type=_enum_values(author_type),
+                    mentions=_snowflake_values(mentions),
+                    mentions_role_id=_snowflake_values(mentions_role),
+                    mention_everyone=mention_everyone,
+                    replied_to_user_id=_snowflake_values(replied_to_user),
+                    replied_to_message_id=_snowflake_values(replied_to_message),
+                    min_id=after.id if after is not None else None,
+                    max_id=before.id if before is not None else None,
+                    limit=retrieve,
+                    offset=None if cursor is not None else offset,
+                    cursor=cursor,
+                    has=_enum_values(has),
+                    link_hostname=list(link_hostname) if link_hostname is not MISSING else None,
+                    embed_provider=list(embed_provider) if embed_provider is not MISSING else None,
+                    embed_type=list(embed_type) if embed_type is not MISSING else None,
+                    attachment_extension=list(attachment_extension) if attachment_extension is not MISSING else None,
+                    attachment_filename=list(attachment_filename) if attachment_filename is not MISSING else None,
+                    pinned=pinned,
+                    include_nsfw=include_nsfw,
+                    channel_id=_snowflake_values(channel),
+                )
+
+                if 'messages' not in data:
+                    # Discord hasn't finished indexing the guild for search yet.
+                    retry_after = data.get('retry_after') or 0.0
+                    if not wait_for_index:
+                        raise RateLimited(retry_after)
+                    await asyncio.sleep(retry_after)
+                    continue
+
+                results.total_results = data.get('total_results')
+                results.doing_deep_historical_index = data.get('doing_deep_historical_index')
+                results.documents_indexed = data.get('documents_indexed')
+
+                groups = data['messages']
+                if not groups:
                     return
 
-            data: MessageSearchResult = await self._state.http.search_guild_messages(
-                self.id,
-                sort_by=sort_by.value,
-                sort_order=sort_order.value,
-                content=content,
-                slop=slop,
-                author_id=_snowflake_values(author),
-                author_type=_enum_values(author_type),
-                mentions=_snowflake_values(mentions),
-                mentions_role_id=_snowflake_values(mentions_role),
-                mention_everyone=mention_everyone,
-                replied_to_user_id=_snowflake_values(replied_to_user),
-                replied_to_message_id=_snowflake_values(replied_to_message),
-                min_id=min_id.id if min_id is not None else None,
-                max_id=max_id.id if max_id is not None else None,
-                limit=retrieve,
-                offset=None if cursor is not None else offset,
-                cursor=cursor,
-                has=_enum_values(has),
-                link_hostname=list(link_hostname) if link_hostname is not MISSING else None,
-                embed_provider=list(embed_provider) if embed_provider is not MISSING else None,
-                embed_type=list(embed_type) if embed_type is not MISSING else None,
-                attachment_extension=list(attachment_extension) if attachment_extension is not MISSING else None,
-                attachment_filename=list(attachment_filename) if attachment_filename is not MISSING else None,
-                pinned=pinned,
-                include_nsfw=include_nsfw,
-                channel_id=_snowflake_values(channel),
-            )
+                for group in groups:
+                    context: List[Message] = []
+                    hit: Optional[Message] = None
 
-            groups = data.get('messages', [])
-            if not groups:
-                return
+                    for raw_message in group:
+                        resolved_channel, _ = self._state._get_guild_channel(raw_message, self.id)
+                        constructed = Message(channel=resolved_channel, data=raw_message, state=self._state)  # type: ignore
 
-            for group in groups:
-                context: List[Message] = []
-                hit: Optional[Message] = None
+                        if raw_message.get('hit'):
+                            hit = constructed
+                        else:
+                            context.append(constructed)
 
-                for raw_message in group:
-                    resolved_channel, _ = self._state._get_guild_channel(raw_message, self.id)
-                    constructed = Message(channel=resolved_channel, data=raw_message, state=self._state)  # type: ignore
+                    if hit is None and context:
+                        hit = context.pop(0)
 
-                    if raw_message.get('hit'):
-                        hit = constructed
-                    else:
-                        context.append(constructed)
+                    if hit is not None:
+                        yield SearchResult(message=hit, context=context)
 
-                if hit is None and context:
-                    hit = context.pop(0)
+                if remaining is not None:
+                    remaining -= len(groups)
+                    if remaining <= 0:
+                        return
 
-                if hit is not None:
-                    yield SearchResult(message=hit, context=context)
-
-            if remaining is not None:
-                remaining -= len(groups)
-                if remaining <= 0:
+                if cursor is not None:
+                    # Advanced usage only fetches a single page with a manually supplied cursor.
                     return
 
-            if len(groups) < retrieve:
-                return
+                offset += len(groups)
 
-            if cursor is not None:
-                # Advanced usage only fetches a single page with a manually supplied cursor.
-                return
+                # A page can be shorter than requested even when more results exist, so
+                # stop only based on total_results, not page size.
+                if results.total_results is not None and offset >= results.total_results:
+                    return
 
-            offset += len(groups)
+        results = GuildSearchResults(_iterator())
+        return results
 
     async def widget(self) -> Widget:
         """|coro|
